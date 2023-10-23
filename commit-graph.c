@@ -473,6 +473,31 @@ static struct commit_graph *load_commit_graph_v1(struct repository *r,
 	return g;
 }
 
+/*
+ * returns 1 if and only if all graphs in the chain have
+ * corrected commit dates stored in the generation_data chunk.
+ */
+static int validate_mixed_generation_chain(struct commit_graph *g)
+{
+	int read_generation_data = 1;
+	struct commit_graph *p = g;
+
+	while (read_generation_data && p) {
+		read_generation_data = p->read_generation_data;
+		p = p->base_graph;
+	}
+
+	if (read_generation_data)
+		return 1;
+
+	while (g) {
+		g->read_generation_data = 0;
+		g = g->base_graph;
+	}
+
+	return 0;
+}
+
 static int add_graph_to_chain(struct commit_graph *g,
 			      struct commit_graph *chain,
 			      struct object_id *oids,
@@ -498,8 +523,6 @@ static int add_graph_to_chain(struct commit_graph *g,
 		cur_g = cur_g->base_graph;
 	}
 
-	g->base_graph = chain;
-
 	if (chain) {
 		if (unsigned_add_overflows(chain->num_commits,
 					   chain->num_commits_in_base)) {
@@ -510,34 +533,46 @@ static int add_graph_to_chain(struct commit_graph *g,
 		g->num_commits_in_base = chain->num_commits + chain->num_commits_in_base;
 	}
 
+	g->base_graph = chain;
+
 	return 1;
 }
 
-static struct commit_graph *load_commit_graph_chain(struct repository *r,
-						    struct object_directory *odb)
+int open_commit_graph_chain(const char *chain_file,
+			    int *fd, struct stat *st)
+{
+	*fd = git_open(chain_file);
+	if (*fd < 0)
+		return 0;
+	if (fstat(*fd, st)) {
+		close(*fd);
+		return 0;
+	}
+	if (st->st_size < the_hash_algo->hexsz) {
+		close(*fd);
+		if (!st->st_size) {
+			/* treat empty files the same as missing */
+			errno = ENOENT;
+		} else {
+			warning("commit-graph chain file too small");
+			errno = EINVAL;
+		}
+		return 0;
+	}
+	return 1;
+}
+
+struct commit_graph *load_commit_graph_chain_fd_st(struct repository *r,
+						   int fd, struct stat *st,
+						   int *incomplete_chain)
 {
 	struct commit_graph *graph_chain = NULL;
 	struct strbuf line = STRBUF_INIT;
-	struct stat st;
 	struct object_id *oids;
 	int i = 0, valid = 1, count;
-	char *chain_name = get_commit_graph_chain_filename(odb);
-	FILE *fp;
-	int stat_res;
+	FILE *fp = xfdopen(fd, "r");
 
-	fp = fopen(chain_name, "r");
-	stat_res = stat(chain_name, &st);
-	free(chain_name);
-
-	if (!fp)
-		return NULL;
-	if (stat_res ||
-	    st.st_size <= the_hash_algo->hexsz) {
-		fclose(fp);
-		return NULL;
-	}
-
-	count = st.st_size / (the_hash_algo->hexsz + 1);
+	count = st->st_size / (the_hash_algo->hexsz + 1);
 	CALLOC_ARRAY(oids, count);
 
 	prepare_alt_odb(r);
@@ -566,6 +601,8 @@ static struct commit_graph *load_commit_graph_chain(struct repository *r,
 				if (add_graph_to_chain(g, graph_chain, oids, i)) {
 					graph_chain = g;
 					valid = 1;
+				} else {
+					free_commit_graph(g);
 				}
 
 				break;
@@ -578,36 +615,32 @@ static struct commit_graph *load_commit_graph_chain(struct repository *r,
 		}
 	}
 
+	validate_mixed_generation_chain(graph_chain);
+
 	free(oids);
 	fclose(fp);
 	strbuf_release(&line);
 
+	*incomplete_chain = !valid;
 	return graph_chain;
 }
 
-/*
- * returns 1 if and only if all graphs in the chain have
- * corrected commit dates stored in the generation_data chunk.
- */
-static int validate_mixed_generation_chain(struct commit_graph *g)
+static struct commit_graph *load_commit_graph_chain(struct repository *r,
+						    struct object_directory *odb)
 {
-	int read_generation_data = 1;
-	struct commit_graph *p = g;
+	char *chain_file = get_commit_graph_chain_filename(odb);
+	struct stat st;
+	int fd;
+	struct commit_graph *g = NULL;
 
-	while (read_generation_data && p) {
-		read_generation_data = p->read_generation_data;
-		p = p->base_graph;
+	if (open_commit_graph_chain(chain_file, &fd, &st)) {
+		int incomplete;
+		/* ownership of fd is taken over by load function */
+		g = load_commit_graph_chain_fd_st(r, fd, &st, &incomplete);
 	}
 
-	if (read_generation_data)
-		return 1;
-
-	while (g) {
-		g->read_generation_data = 0;
-		g = g->base_graph;
-	}
-
-	return 0;
+	free(chain_file);
+	return g;
 }
 
 struct commit_graph *read_commit_graph_one(struct repository *r,
@@ -617,8 +650,6 @@ struct commit_graph *read_commit_graph_one(struct repository *r,
 
 	if (!g)
 		g = load_commit_graph_chain(r, odb);
-
-	validate_mixed_generation_chain(g);
 
 	return g;
 }
@@ -723,19 +754,10 @@ struct bloom_filter_settings *get_bloom_filter_settings(struct repository *r)
 	return NULL;
 }
 
-static void close_commit_graph_one(struct commit_graph *g)
-{
-	if (!g)
-		return;
-
-	clear_commit_graph_data_slab(&commit_graph_data_slab);
-	close_commit_graph_one(g->base_graph);
-	free_commit_graph(g);
-}
-
 void close_commit_graph(struct raw_object_store *o)
 {
-	close_commit_graph_one(o->commit_graph);
+	clear_commit_graph_data_slab(&commit_graph_data_slab);
+	free_commit_graph(o->commit_graph);
 	o->commit_graph = NULL;
 }
 
@@ -2072,9 +2094,11 @@ static int write_commit_graph_file(struct write_commit_graph_context *ctx)
 			free(graph_name);
 		}
 
+		free(ctx->commit_graph_hash_after[ctx->num_commit_graphs_after - 1]);
 		ctx->commit_graph_hash_after[ctx->num_commit_graphs_after - 1] = xstrdup(hash_to_hex(file_hash));
 		final_graph_name = get_split_graph_filename(ctx->odb,
 					ctx->commit_graph_hash_after[ctx->num_commit_graphs_after - 1]);
+		free(ctx->commit_graph_filenames_after[ctx->num_commit_graphs_after - 1]);
 		ctx->commit_graph_filenames_after[ctx->num_commit_graphs_after - 1] = final_graph_name;
 
 		result = rename(ctx->graph_name, final_graph_name);
@@ -2523,6 +2547,7 @@ int write_commit_graph(struct object_directory *odb,
 
 cleanup:
 	free(ctx->graph_name);
+	free(ctx->base_graph_name);
 	free(ctx->commits.list);
 	oid_array_clear(&ctx->oids);
 	clear_topo_level_slab(&topo_levels);
@@ -2753,15 +2778,17 @@ int verify_commit_graph(struct repository *r, struct commit_graph *g, int flags)
 
 void free_commit_graph(struct commit_graph *g)
 {
-	if (!g)
-		return;
-	if (g->data) {
-		munmap((void *)g->data, g->data_len);
-		g->data = NULL;
+	while (g) {
+		struct commit_graph *next = g->base_graph;
+
+		if (g->data)
+			munmap((void *)g->data, g->data_len);
+		free(g->filename);
+		free(g->bloom_filter_settings);
+		free(g);
+
+		g = next;
 	}
-	free(g->filename);
-	free(g->bloom_filter_settings);
-	free(g);
 }
 
 void disable_commit_graph(struct repository *r)

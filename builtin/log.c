@@ -118,16 +118,19 @@ static struct string_list decorate_refs_exclude = STRING_LIST_INIT_NODUP;
 static struct string_list decorate_refs_exclude_config = STRING_LIST_INIT_NODUP;
 static struct string_list decorate_refs_include = STRING_LIST_INIT_NODUP;
 
-static int clear_decorations_callback(const struct option *opt,
-					    const char *arg, int unset)
+static int clear_decorations_callback(const struct option *opt UNUSED,
+				      const char *arg, int unset)
 {
+	BUG_ON_OPT_NEG(unset);
+	BUG_ON_OPT_ARG(arg);
 	string_list_clear(&decorate_refs_include, 0);
 	string_list_clear(&decorate_refs_exclude, 0);
 	use_default_decoration_filter = 0;
 	return 0;
 }
 
-static int decorate_callback(const struct option *opt, const char *arg, int unset)
+static int decorate_callback(const struct option *opt UNUSED, const char *arg,
+			     int unset)
 {
 	if (unset)
 		decoration_style = 0;
@@ -173,16 +176,15 @@ static void cmd_log_init_defaults(struct rev_info *rev)
 	if (default_follow)
 		rev->diffopt.flags.default_follow_renames = 1;
 	rev->verbose_header = 1;
+	init_diffstat_widths(&rev->diffopt);
 	rev->diffopt.flags.recursive = 1;
-	rev->diffopt.stat_width = -1; /* use full terminal width */
-	rev->diffopt.stat_graph_width = -1; /* respect statGraphWidth config */
+	rev->diffopt.flags.allow_textconv = 1;
 	rev->abbrev_commit = default_abbrev_commit;
 	rev->show_root_diff = default_show_root;
 	rev->subject_prefix = fmt_patch_subject_prefix;
 	rev->patch_name_max = fmt_patch_name_max;
 	rev->show_signature = default_show_signature;
 	rev->encode_email_headers = default_encode_email_headers;
-	rev->diffopt.flags.allow_textconv = 1;
 
 	if (default_date_mode)
 		parse_date_format(default_date_mode, &rev->date_mode);
@@ -1564,7 +1566,8 @@ static int inline_callback(const struct option *opt, const char *arg, int unset)
 	return 0;
 }
 
-static int header_callback(const struct option *opt, const char *arg, int unset)
+static int header_callback(const struct option *opt UNUSED, const char *arg,
+			   int unset)
 {
 	if (unset) {
 		string_list_clear(&extra_hdr, 0);
@@ -1573,24 +1576,6 @@ static int header_callback(const struct option *opt, const char *arg, int unset)
 	} else {
 		add_header(arg);
 	}
-	return 0;
-}
-
-static int to_callback(const struct option *opt, const char *arg, int unset)
-{
-	if (unset)
-		string_list_clear(&extra_to, 0);
-	else
-		string_list_append(&extra_to, arg);
-	return 0;
-}
-
-static int cc_callback(const struct option *opt, const char *arg, int unset)
-{
-	if (unset)
-		string_list_clear(&extra_cc, 0);
-	else
-		string_list_append(&extra_cc, arg);
 	return 0;
 }
 
@@ -1968,8 +1953,8 @@ int cmd_format_patch(int argc, const char **argv, const char *prefix)
 		OPT_GROUP(N_("Messaging")),
 		OPT_CALLBACK(0, "add-header", NULL, N_("header"),
 			    N_("add email header"), header_callback),
-		OPT_CALLBACK(0, "to", NULL, N_("email"), N_("add To: header"), to_callback),
-		OPT_CALLBACK(0, "cc", NULL, N_("email"), N_("add Cc: header"), cc_callback),
+		OPT_STRING_LIST(0, "to", &extra_to, N_("email"), N_("add To: header")),
+		OPT_STRING_LIST(0, "cc", &extra_cc, N_("email"), N_("add Cc: header")),
 		OPT_CALLBACK_F(0, "from", &from, N_("ident"),
 			    N_("set From address to <ident> (or committer ident if absent)"),
 			    PARSE_OPT_OPTARG, from_callback),

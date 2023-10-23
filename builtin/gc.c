@@ -52,6 +52,7 @@ static const char * const builtin_gc_usage[] = {
 static int pack_refs = 1;
 static int prune_reflogs = 1;
 static int cruft_packs = 1;
+static unsigned long max_cruft_size;
 static int aggressive_depth = 50;
 static int aggressive_window = 250;
 static int gc_auto_threshold = 6700;
@@ -61,6 +62,8 @@ static timestamp_t gc_log_expire_time;
 static const char *gc_log_expire = "1.day.ago";
 static const char *prune_expire = "2.weeks.ago";
 static const char *prune_worktrees_expire = "3.months.ago";
+static char *repack_filter;
+static char *repack_filter_to;
 static unsigned long big_pack_threshold;
 static unsigned long max_delta_cache_size = DEFAULT_DELTA_CACHE_SIZE;
 
@@ -163,12 +166,16 @@ static void gc_config(void)
 	git_config_get_int("gc.autopacklimit", &gc_auto_pack_limit);
 	git_config_get_bool("gc.autodetach", &detach_auto);
 	git_config_get_bool("gc.cruftpacks", &cruft_packs);
+	git_config_get_ulong("gc.maxcruftsize", &max_cruft_size);
 	git_config_get_expiry("gc.pruneexpire", &prune_expire);
 	git_config_get_expiry("gc.worktreepruneexpire", &prune_worktrees_expire);
 	git_config_get_expiry("gc.logexpiry", &gc_log_expire);
 
 	git_config_get_ulong("gc.bigpackthreshold", &big_pack_threshold);
 	git_config_get_ulong("pack.deltacachesize", &max_delta_cache_size);
+
+	git_config_get_string("gc.repackfilter", &repack_filter);
+	git_config_get_string("gc.repackfilterto", &repack_filter_to);
 
 	git_config(git_default_config, NULL);
 }
@@ -347,6 +354,9 @@ static void add_repack_all_option(struct string_list *keep_pack)
 		strvec_push(&repack, "--cruft");
 		if (prune_expire)
 			strvec_pushf(&repack, "--cruft-expiration=%s", prune_expire);
+		if (max_cruft_size)
+			strvec_pushf(&repack, "--max-cruft-size=%lu",
+				     max_cruft_size);
 	} else {
 		strvec_push(&repack, "-A");
 		if (prune_expire)
@@ -355,6 +365,11 @@ static void add_repack_all_option(struct string_list *keep_pack)
 
 	if (keep_pack)
 		for_each_string_list(keep_pack, keep_one_pack, NULL);
+
+	if (repack_filter && *repack_filter)
+		strvec_pushf(&repack, "--filter=%s", repack_filter);
+	if (repack_filter_to && *repack_filter_to)
+		strvec_pushf(&repack, "--filter-to=%s", repack_filter_to);
 }
 
 static void add_repack_incremental_option(void)
@@ -575,6 +590,8 @@ int cmd_gc(int argc, const char **argv, const char *prefix)
 			N_("prune unreferenced objects"),
 			PARSE_OPT_OPTARG, NULL, (intptr_t)prune_expire },
 		OPT_BOOL(0, "cruft", &cruft_packs, N_("pack unreferenced objects separately")),
+		OPT_MAGNITUDE(0, "max-cruft-size", &max_cruft_size,
+			      N_("with --cruft, limit the size of new cruft packs")),
 		OPT_BOOL(0, "aggressive", &aggressive, N_("be more thorough (increased runtime)")),
 		OPT_BOOL_F(0, "auto", &auto_gc, N_("enable auto-gc mode"),
 			   PARSE_OPT_NOCOMPLETE),
@@ -1403,7 +1420,7 @@ static void initialize_task_config(int schedule)
 	strbuf_release(&config_name);
 }
 
-static int task_option_parse(const struct option *opt,
+static int task_option_parse(const struct option *opt UNUSED,
 			     const char *arg, int unset)
 {
 	int i, num_selected = 0;
@@ -2434,7 +2451,7 @@ static int systemd_timer_write_service_template(const char *exec_path)
 	       "LockPersonality=yes\n"
 	       "MemoryDenyWriteExecute=yes\n"
 	       "NoNewPrivileges=yes\n"
-	       "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6\n"
+	       "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_VSOCK\n"
 	       "RestrictNamespaces=yes\n"
 	       "RestrictRealtime=yes\n"
 	       "RestrictSUIDSGID=yes\n"
